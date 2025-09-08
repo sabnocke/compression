@@ -1,19 +1,22 @@
+import sys
 from collections import namedtuple
+from collections.abc import Iterator
 from itertools import chain, tee, filterfalse
 from pathlib import Path
 from pprint import pprint
-from typing import Iterable, Callable, Any, Dict, List, Union
+from typing import Iterable, Callable, Any, Dict, List, Union, Generator, Tuple
+import subprocess
+import time
 
 import ffmpeg
 from icecream import ic
 
 from c_types import Collection2
+from functools2 import *
 
 Collection = namedtuple("Collection", ["path", "stream", "codec_name", "width", "height", "alive"])
 
 type SegmentableCollection = Union[Iterable[Collection2], Dict[str, Iterable[Collection2]]]
-
-#TODO make the stream/probe into its own dataclass/attr
 
 def get_duration(stream: Dict[str, Any]) -> float:
     lg = float(stream.get("duration", 0))
@@ -42,26 +45,12 @@ def ffprobe(to_probe: Path, ignore_errors: bool = False):
             to_probe, 0.0, 0, 0 , "", "", "", False
         )
 
-def partition[T](predicate: Callable[[T], bool], iterable: Iterable[T]):
-    """
-    Use a predicate to partition entries into true entries and false entries.
-    """
-    t1, t2 = tee(iterable)
-    return filter(predicate, t2), filterfalse(predicate, t1)
 
-def seg_by_resolution_plus(collection: Iterable[Collection2]):
-    index: Dict[str, List[Collection2]] = {}
-    for each in collection:
-        if not each:
-            continue
 
-        width = each.width
-        if width in index:
-            index[str(width)].append(each)
-        else:
-            index[str(width)] = [each]
-
-    return index
+def seg_by_resolution_plus(collection: Iterable[Collection2], *values: int) -> Generator[Iterator[Collection2], Any, None]:
+    for v in values:
+        good, bad = partition(lambda x: x.width == v, collection)
+        yield good
 
 def seg_by_codec_plus(collection: Iterable[Collection2]):
     index = {}
@@ -119,20 +108,60 @@ def useful_stats(collection: Iterable[Collection]):
     print(f"\ntotal duration: {duration}s for {count} entries with {missing} missing entries")
     return count, missing, round(duration, 3), round(duration / (count + missing), 3) if (count + missing) > 0 else 0
 
-def prepare(item: Collection):
+@measure
+def prepare(_item: Collection2):
+    name, ext = _item.path.absolute().__str__().rsplit('.', 1)
+    out_name = f"{name}.2.{ext}"
+    # print(name, ext)
+    print(out_name)
     try:
-        (
+        process: subprocess.Popen = (
             ffmpeg
-            .input(str(item.path))
+            .input(str(_item.path), hwaccel="cuda")
             .filter("pad", 1920, 1080, 0, "(1080-ih)/2")
-            .output(str(item.path))
-            .run(overwrite_output=True)
+            .output(out_name, vcodec="h264_nvenc")
+            .run_async(pipe_stdout=True, pipe_stderr=True)
         )
+
+        while process.poll() is None:
+            output = process.stderr.read(2048)
+            if output:
+                sys.stdout.buffer.write(output)
+            # time.sleep(0.1)  # Small delay to prevent high CPU usage
+
+        process.wait()
         return True
     except ffmpeg.Error as e:
-        print(f"An error occurred while processing {item.path}.")
+        print(f"An error occurred while processing {_item.path}.")
         print(f"stderr: {e.stderr.decode('utf8')}")
         return False
+
+@measure
+def split_into_frames(_item: Collection2):
+    output = _item.path.parent / "frames"
+    output.mkdir(parents=True, exist_ok=True)
+    output_path = output / "frame_%05d.png"
+
+    try:
+        process: subprocess.Popen = (
+            ffmpeg
+            .input(str(_item.path), hwaccel="cuda")
+            .output(str(output_path), qscale=1)
+            .run_async(pipe_stdout=True, pipe_stderr=True)
+        )
+
+        while process.poll() is None:
+            output = process.stderr.read(2048)
+            if output:
+                sys.stdout.buffer.write(output)
+
+        process.wait()
+        return True
+    except ffmpeg.Error as e:
+        print(f"An error occurred while processing {_item.path}.")
+        print(f"stderr: {e.stderr.decode('utf8')}")
+        return False
+
 
 avi_pattern = "*.avi"
 mp4_pattern = "*.mp4"
@@ -144,15 +173,14 @@ mp4 = p.rglob(mp4_pattern)
 avi = p.rglob(avi_pattern)
 mkv = p.rglob(mkv_pattern)
 
+complete: Iterator[Path]
+completeAlt: Iterator[Path]
 complete, completeAlt = tee(chain(mp4, avi, mkv))
+complete2: Iterator[Collection2]
+complete2alt: Iterator[Collection2]
 complete2, complete2alt = tee(map(lambda x: ffprobe(x, True), complete))
 
-items = seg_by_resolution_plus(complete2)
-for key, values in items.items():
-    print(key)
-    _r = seg_by_codec_plus(values)
-    pprint(_r)
+r1920_h264: Iterator[Collection2] = filter(lambda i: i.is_1920_x264 and i.is_height(1080), complete2)
 
-
-
-
+for n, item in enumerate(r1920_h264):
+    print(n, item.c_name, item.width, item.height)
